@@ -1,0 +1,201 @@
+#!/bin/bash
+
+CMDNAME="${0##*/}"
+
+if [ "`id -u`" = "0" ]; then
+    DATASTORE=@localstatedir@/lib/builddist/progressbar
+else
+    DATASTORE=~/.builddist/data/progressbar
+fi
+
+term_resize()
+{
+    local MY_NLINES
+    local MY_NCOLS
+    local MY_FULLBAR="####"
+    local MY_CLEARBAR="    "
+
+    MY_NLINES=`tput lines`
+    MY_NCOLS=`tput cols`
+    [ ! -z "$MY_NLINES" ] && export NUM_LINES="$MY_NLINES"
+
+    if [ ! -z "$MY_NCOLS" ]; then
+        export NUM_COLS="$MY_NCOLS"
+
+        while [ "${#MY_FULLBAR}" -lt $((MY_NCOLS)) ]; do
+            MY_FULLBAR="${MY_FULLBAR}${MY_FULLBAR}"
+            MY_CLEARBAR="${MY_CLEARBAR}${MY_CLEARBAR}"
+        done
+
+        export FULLBAR="${MY_FULLBAR}"
+        export CLEARBAR="${MY_CLEARBAR}"
+    fi
+
+    return 0
+}
+
+trap "term_resize" WINCH
+
+term_resize
+
+if [ $# -lt 3 ]; then
+    # Most likely we're processing the output of a raw command rather than
+    # a build line.
+    RAW_CMD=yes
+else
+    RAW_CMD=no
+fi
+
+# If we're chained to some other plugin, put all our progress-bar output on
+# stderr so we can pass input through to the next plugin.  If stdout is
+# actually a terminal, though, then just use it as-is.
+if [ -t 1 ]; then
+    DISPLAY_DESC=1
+else
+    DISPLAY_DESC=2
+fi
+
+if [ "$RAW_CMD" = "no" ]; then
+    SRCNAME="$1"
+    SRCARCH="$2"
+    SRCVER="$3"
+
+    if [ -z "$SRCNAME" ] || [ -z "$SRCVER" ]; then
+        echo "ERROR: Missing package name and/or version" >&2
+        exit 1
+    fi
+
+    if [ -z "$SRCARCH" ] || [ "$SRCARCH" = "-" ]; then
+        SRCARCH=`dpkg-architecture -q DEB_HOST_ARCH`
+    fi
+fi
+
+[ -f @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+[ -r @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+. @sysconfdir@/builddist/plugins/${CMDNAME}.conf
+
+if [ "$RAW_CMD" = "no" ]; then
+    if [ -f "$DATASTORE" ] && [ -r "$DATASTORE" ]; then
+        while read THIS_PKG THIS_LINECOUNT THIS_RUNCOUNT THEREST; do
+            if [ "$THIS_PKG" = "${SRCNAME}_${SRCVER}_${SRCARCH}" ]; then
+                AVG_LINECOUNT="$THIS_LINECOUNT"
+                RUNCOUNT="$THIS_RUNCOUNT"
+                break
+            fi
+        done < "$DATASTORE"
+    else
+        mkdir -p "${DATASTORE%/*}" || exit $?
+        AVG_LINECOUNT=""
+        RUNCOUNT=""
+    fi
+
+    if [ -z "$AVG_LINECOUNT" ] || [ -n "${AVG_LINECOUNT//[0-9]/}" ]; then
+        AVG_LINECOUNT=""
+    fi
+
+    if [ -z "$RUNCOUNT" ] || [ -n "${RUNCOUNT//[0-9]/}" ]; then
+        RUNCOUNT=""
+    fi
+else
+    AVG_LINECOUNT=""
+    RUNCOUNT=""
+fi
+
+export IFS=$'\n'
+LINECOUNT=0
+TICKER=( '|' '/' '-' '\' )
+TICKER_POS=0
+TICKER_INC=1
+TICKER_IDX=0
+BUILD_STATUS=ok
+LASTLINE=""
+
+if [ "$RAW_CMD" = "yes" ]; then
+    # We're assuming the line number is prepended to the sanitized command
+    # name (i.e. "<num>:<command> ...(args)...").
+    if [ -z "$@" ]; then
+        echo "RUNNING unidentified command..."
+    else
+        echo "RUNNING command from line $@"
+    fi
+else
+    echo "BUILDING ${SRCNAME}_${SRCVER} for ${SRCARCH}:" >&$DISPLAY_DESC
+fi
+
+while read THISLINE; do
+    # Play nice and pass our input through to the next plugin in the chain.
+    [ ! -t 1 ] && echo "$THISLINE"
+    LASTLINE="$THISLINE"
+    LINECOUNT=$((LINECOUNT+1))
+    BARLEN=$((NUM_COLS-16))
+
+    if [ -n "$AVG_LINECOUNT" ]; then
+        PERCENT=$(((LINECOUNT*100)/AVG_LINECOUNT))
+        [ $((PERCENT)) -ge 100 ] && PERCENT=99
+        TICKER_POS=$(((BARLEN*PERCENT)/100))
+        TICKER_IDX=$((LINECOUNT%4))
+        LEFT_LEN="$TICKER_POS"
+	RIGHT_LEN=$((BARLEN-TICKER_POS-1))
+	LEFT_BAR="${FULLBAR:0:$LEFT_LEN}"
+	RIGHT_BAR="${CLEARBAR:0:$RIGHT_LEN}"
+    else
+        PERCENT=""
+        TICKER_POS=$((TICKER_POS+TICKER_INC))
+
+	if [ $((TICKER_POS)) -ge $((BARLEN)) ]; then
+            TICKER_INC=-1
+	    TICKER_POS=$((BARLEN-1))
+	elif [ $((TICKER_POS)) -lt 0 ]; then
+            TICKER_INC=1
+            TICKER_POS=0
+        fi
+    
+        TICKER_IDX=$((TICKER_POS%4))
+        LEFT_LEN="$TICKER_POS"
+        RIGHT_LEN=$((BARLEN-TICKER_POS-1))
+	LEFT_BAR="${CLEARBAR:0:$LEFT_LEN}"
+	RIGHT_BAR="${CLEARBAR:0:$RIGHT_LEN}"
+    fi
+
+    if [ -z "$PERCENT" ]; then
+        echo -ne '\r        ['"${LEFT_BAR}${TICKER[$TICKER_IDX]}${RIGHT_BAR}"']' >&$DISPLAY_DESC
+    else
+        echo -ne '\r        ['"${LEFT_BAR}${TICKER[$TICKER_IDX]}${RIGHT_BAR}"']' >&$DISPLAY_DESC
+       	printf '% 3d%%' $((PERCENT)) >&$DISPLAY_DESC
+    fi
+done
+
+if [ "$RAW_CMD" = "no" ]; then
+    case "$LASTLINE" in
+    # NOTE: current builddist's core package builder is now guaranteed to print
+    # an "ERROR: ..." line if it fails at any point.  We did this specifically
+    # so we can limit how many wildcard expressions are necessary for this case
+    # statement.
+    *"dpkg-buildpackage: error:"* | \
+    *"No such file or directory"* | \
+    *" failed" | \
+    "ERROR: "* | \
+    *" ERROR: "*)
+        # Looks like a build failure.  Echo this out on stderr, and disregard
+        # the measured line count for record-keeping purposes.
+        echo
+        echo "$LASTLINE" >&2
+        exit 1
+        ;;
+    esac
+fi
+
+BARLEN=$((NUM_COLS-16))
+
+if [ -n "$AVG_LINECOUNT" ]; then
+    echo -e '\r        ['"${FULLBAR:0:$BARLEN}"'] 100%' >&$DISPLAY_DESC
+    AVG_LINECOUNT=$(((AVG_LINECOUNT*RUNCOUNT)+LINECOUNT))
+    RUNCOUNT=$((RUNCOUNT+1))
+    AVG_LINECOUNT=$((AVG_LINECOUNT/RUNCOUNT))
+    sed -ri "s|^\s*${SRCNAME}_${SRCVER}_${SRCARCH}\s.*"'$'"|${SRCNAME}_${SRCVER}_${SRCARCH} ${AVG_LINECOUNT} ${RUNCOUNT}|" "$DATASTORE"
+else
+    echo -e '\r        ['"${FULLBAR:0:$BARLEN}"']' >&$DISPLAY_DESC
+    echo "${SRCNAME}_${SRCVER}_${SRCARCH} ${LINECOUNT} 1" >> "$DATASTORE"
+fi
+
+exit 0

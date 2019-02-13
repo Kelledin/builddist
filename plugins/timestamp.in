@@ -1,0 +1,25 @@
+#!/bin/bash
+
+CMDNAME="${0##*/}"
+
+# Locale-friendly alternative: "[%x %X] "
+DATE_FORMAT="[%Y%m%d-%T] "
+
+[ -f @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+[ -r @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+. @sysconfdir@/builddist/plugins/${CMDNAME}.conf
+
+date +"${DATE_FORMAT}" >/dev/null || exit $?
+
+if [ -n "${LOGDIR}" ]; then
+    mkdir -p "${LOGDIR}" || exit $?
+    LOGFILE="${LOGDIR}/${SRCNAME}_${SRCVER}_${BUILDDATE}.log"
+fi
+
+IFS=$'\n'
+
+while read MYLINE; do 
+    echo `date "+${DATE_FORMAT}"`"${MYLINE}"
+done
+
+exit 0

@@ -1,0 +1,48 @@
+#!/bin/bash
+
+CMDNAME="${0##*/}"
+
+if [ "`id -u`" = "0" ]; then
+    LOGDIR=@localstatedir@/log/builddist
+else
+    LOGDIR=~/.builddist/logs
+fi
+
+if [ $# -lt 1 ]; then
+    LOGNAME=UNKNOWN
+elif [ $# -lt 2 ]; then
+    # We're assuming the line number is prepended to the sanitized command
+    # name (i.e. "<num>:<command> ...(args)...").  The ellipsized args are
+    # only for console presentation, so strip that segment off when generating
+    # the log name.
+    LOGNAME="${1%% *}"
+else
+    SRCNAME="$1"
+    SRCARCH="$2"
+    SRCVER="$3"
+
+    if [ -z "$SRCNAME" ] || [ -z "$SRCVER" ]; then
+        echo "ERROR: Missing package name and/or version" >&2
+        exit 1
+    fi
+
+    if [ -z "$SRCARCH" ] || [ "$SRCARCH" = "-" ]; then
+        SRCARCH=`dpkg-architecture -q DEB_HOST_ARCH`
+    fi
+
+    LOGNAME="${SRCNAME}_${SRCVER}_${SRCARCH}"
+fi
+
+BUILDDATE=`date +%Y-%m-%d-%T`
+
+[ -f @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+[ -r @sysconfdir@/builddist/plugins/${CMDNAME}.conf ] &&
+. @sysconfdir@/builddist/plugins/${CMDNAME}.conf
+
+if [ -n "${LOGDIR}" ]; then
+    mkdir -p "${LOGDIR}" || exit $?
+    LOGFILE="${LOGDIR}/${LOGNAME}_${BUILDDATE}.log"
+fi
+
+tee -a "${LOGFILE}"
+exit $?

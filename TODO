@@ -1,0 +1,6 @@
+Features planned for future releases:
+
+ - Support for downloading source via apt and building in chroot
+ - Support for post-build audit plugins
+ - Add a man page
+
