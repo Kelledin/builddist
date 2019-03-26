@@ -2,9 +2,11 @@
 
 export CMDPATH="${0##*/}"
 export PLUGIN_LIST=""
-export BUILD_USER=""
+export BUILD_USER=`id -un`
+export MY_UID=`id -u`
 export VERBOSITY=1
 export PLUGINDIR="@plugindir@"
+ischroot && export IN_CHROOT=yes || export IN_CHROOT=no
 
 # Normalize trailing slashes in the plugin directory.
 while [ -n "$PLUGINDIR" ] && [ "${PLUGINDIR%/}" != "$PLUGINDIR" ]; do
@@ -95,7 +97,7 @@ build_by_line() {
     local ROOT="$PWD" NAME PKGARCH VER BLDOPTS INSTOPTS BINS N LEN BUILDDIR
     local DSCPATH JOBOPT="$DEFAULT_JOBOPT" ARTDIR="$PWD" SUDO_CMD="" BINVER=""
     local BINARCH="" THISBIN CMDTOKS BUILDCMD INSTALLOPT="-i" THISOPT RVAL=0
-    local LOADOPT="$DEFAULT_LOADOPT"
+    local LOADOPT="$DEFAULT_LOADOPT" PROFILES="" USE_ENVOPTS="" PROFOPT=""
 
     case "$1" in
     -r | --root) ROOT="$2"                            ; shift 2  ;;
@@ -106,7 +108,8 @@ build_by_line() {
     esac
 
     if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] ||
-       [ -z "$5" ] || [ -z "$6" ] || [ -z "$ROOT" ]; then
+       [ -z "$5" ] || [ -z "$6" ] || [ -z "$ROOT" ] ||
+       [ "$#" = 7 -a -z "$7" ]; then
         echo "ERROR: blank or insufficient command-line options!" >&2
         return 1
     fi
@@ -115,8 +118,21 @@ build_by_line() {
     PKGARCH="$2"
     VER="$3"
     BLDOPTS=( `echo "${4//,/ }"` )
-    INSTOPTS=( `echo "${5//,/ }"` )
-    BINS=( `echo "${6//,/ }"` )
+
+    if [ "$#" = "7" ]; then
+        # New format: build profiles are specified as the fifth token.
+        if [ "$5" != "-" ] && [ "$5" != "*" ]; then
+            PROFILES="$5"
+            PROFOPT="-P${PROFILES}"
+        fi
+
+        INSTOPTS=( `echo "${6//,/ }"` )
+        BINS=( `echo "${7//,/ }"` )
+    else
+        # Old format: build profiles may be specified in the build flags.
+        INSTOPTS=( `echo "${5//,/ }"` )
+        BINS=( `echo "${6//,/ }"` )
+    fi
 
     if [ "${ROOT#?*://}" = "$ROOT" ] && [ "${ROOT#/}" != "$ROOT" ]; then
         # Relative local path?  Turn it into an absolute path.
@@ -127,11 +143,11 @@ build_by_line() {
     # reboots, and may not behave exactly like a typical filesystem in all
     # corner-cases.  This could affect results for build-time unit/regression
     # tests, so we use @localstatedir@/tmp instead.
-    if [ -n "$PKGARCH" ] && [ "$PKGARCH" != "-" ]; then
-        BUILDDIR=`mktemp -d @localstatedir@/tmp/.build.${NAME}_${VER}_${PKGARCH}.XXXXXX`
-    else
-        BUILDDIR=`mktemp -d @localstatedir@/tmp/.build.${NAME}_${VER}.XXXXXX`
-    fi
+    #
+    # Furthermore, we occasionally find packages that are sensitive to very
+    # long source directory paths, especially during unit-testing with GNU
+    # expect.  So we keep the build directory path short and sweet.
+    BUILDDIR=`mktemp -d @localstatedir@/tmp/.build.XXXXXX`
 
     if [ -z "$BUILDDIR" ] || [ ! -d "$BUILDDIR" ]; then
         echo "ERROR: cannot create temporary directory" >&2
@@ -151,7 +167,9 @@ build_by_line() {
         return $RVAL
     fi
 
-    # Make sure job count is specified in the build options.
+    # Make sure job count is specified in the build options.  While we're
+    # perusing the build options, also keep an eye out for user-specified
+    # build profiles.
     LEN="${#BLDOPTS[@]}"
 
     if [ "$LEN" = "1" ] && [ "${BLDOPTS[0]}" = "-" ]; then
@@ -160,16 +178,59 @@ build_by_line() {
         JOBOPT=""
         LOADOPT=""
     else
-        for (( N=0; N<LEN; N++ )); do
+        N=0
+
+        # We use a while loop instead of a for loop because we may have to
+        # update our counter in mid-cycle (and I don't know how this will
+        # mesh with bash's own for-loop counter semantics).
+        while [ $((N)) -lt $((LEN)) ]; do
             THISOPT="${BLDOPTS[$N]}"
+            N=$((N+1))
 
             if [ "${THISOPT#-j}" != "$THISOPT" ] || [ "${THISOPT#--jobs}" != "$THISOPT" ]; then
                 JOBOPT=""
             elif [ "${THISOPT#-l}" != "$THISOPT" ] || [ "${THISOPT#--load}" != "$THISOPT" ]; then
                 LOADOPT=""
+            elif [ "$THISOPT" = "-P" ] || [ "$THISOPT" = "--build-profiles" ]; then
+                # Technically, build profiles should be specified as their own
+                # token now (new 7-token build line format).  If this line is
+                # still in the legacy 6-token format, accep this with a warning;
+                # if using the new 7-token format, then bail out now.
+                if [ -z "$PROFOPT" ]; then
+                    echo "WARNING: Build profiles should be specified in their own token." >&2
+                else
+                    echo "ERROR: Build profile(s) set in both token 5 and build arguments!" >&2
+                    return 1
+                fi
+
+                # FIXME: if there's no further options, that technically seems
+                # like an invalid invocation of dpkg-buildpackage.  Should we
+                # maybe flag that and bail out here?
+                if [ $((N)) -lt $((LEN)) ]; then
+                    PROFILES="${BLDOPTS[$N]}"
+                    N=$((N+1))
+                fi
+            elif [ "${THISOPT#-P}" != "$THISOPT" ]; then
+                PROFILES="${THISOPT#-P}"
+            elif [ "${THISOPT#--build-profiles=}" != "$THISOPT" ]; then
+                PROFILES="${THISOPT#--build-profiles=}"
             fi
         done
     fi
+
+    USE_ENVOPTS="$DEB_BUILD_OPTIONS"
+
+    # If "nocheck" or "nodoc" are in the user-specified build profiles, then
+    # we want to propagate these tokens into DEB_BUILD_OPTIONS as well.
+    for THISOPT in nodoc nocheck; do
+        case "$PROFILES" in
+        ${THISOPT} | *,${THISOPT} | ${THISOPT},* | *,${THISOPT},*)
+            USE_ENVOPTS="$USE_ENVOPTS $THISOPT"
+            ;;
+        esac
+    done
+
+    USE_ENVOPTS="${USE_ENVOPTS# }"
 
     if [ -n "$PKGARCH" ] && [ "$PKGARCH" != "-" ]; then
         PKGARCH="--host-arch ${PKGARCH} --target-arch ${PKGARCH}"
@@ -178,7 +239,7 @@ build_by_line() {
     fi
 
     if [ -n "${PKGARCH}${JOBOPT}${LOADOPT}" ]; then
-        for THISOPT in $PKGARCH $JOBOPT $LOADOPT ; do
+        for THISOPT in $PKGARCH $JOBOPT $LOADOPT $PROFOPT ; do
             if [ -n "$THISOPT" ] && [ "$THISOPT" != "-" ]; then
                 LEN="${#BLDOPTS[@]}"
                 BLDOPTS[$LEN]="$THISOPT"
@@ -186,8 +247,10 @@ build_by_line() {
         done
     fi
 
-    if [ "`id -u`" != "0" ]; then
-        SUDO_CMD=sudo
+    if [ $((MY_UID)) -ne 0 ]; then
+        SUDO_CMD="sudo -u ${BUILD_USER}"
+    else
+        SUDO_CMD="su ${BUILD_USER} -c"
     fi
 
     cd "${NAME}-${VER%-*}" || RVAL=$?
@@ -202,13 +265,28 @@ build_by_line() {
     else
         BUILDCMD="dpkg-buildpackage --build=binary ${BLDOPTS[@]}"
     fi
- 
-    if [ -n "$BUILD_USER" ] && [ "`id -u`" = "0" ]; then
-        chown -R "$BUILD_USER" "$BUILDDIR" &&
-        su "$BUILD_USER" -c "$BUILDCMD" ||
-        RVAL=$?
+
+    echo "builddist: DEB_BUILD_OPTIONS='$USE_ENVOPTS', dpkg-buildpackage options='${BLDOPTS[@]}'"
+
+    if [ $((MY_UID)) -ne $((BUILD_UID)) ]; then
+        # FIXME: have a separate sudo command for the chown step...
+        chown -R "$BUILD_USER" "$BUILDDIR" || RVAL=$?
+
+        if [ "$RVAL" = "0" ]; then
+            if [ -n "${USE_ENVOPTS}" ]; then
+                DEB_BUILD_OPTIONS="${USE_ENVOPTS}" \
+                $SUDO_CMD "$BUILDCMD" || RVAL=$?
+            else
+                $SUDO_CMD "$BUILDCMD" || RVAL=?$
+            fi
+        fi
     else
-        $BUILDCMD || RVAL=$?
+        if [ -n "${USE_ENVOPTS}" ]; then
+            DEB_BUILD_OPTIONS="${USE_ENVOPTS}" \
+            $BUILDCMD || RVAL=$?
+        else
+            $BUILDCMD || RVAL=$?
+        fi
     fi
 
     if [ "$RVAL" != "0" ]; then
@@ -257,7 +335,11 @@ build_by_line() {
     done
 
     if [ "${#INSTOPTS[@]}" = "1" ] && [ "${INSTOPTS[0]}" = "-" ]; then
-        $SUDO_CMD dpkg $INSTALLOPT -- "${BINS[@]}" || RVAL=$?
+        if [ $((MY_UID)) -eq 0 ]; then
+            dpkg $INSTALLOPT -- "${BINS[@]}" || RVAL=$?
+        else
+            $SUDO_CMD "dpkg $INSTALLOPT -- ${BINS[@]}" || RVAL=$?
+        fi
     else
         # Make sure user hasn't specified a different variant of the typical
         # install option (such as "--unpack").  If so, the user-specified
@@ -275,7 +357,11 @@ build_by_line() {
             fi
         done
 
-        $SUDO_CMD dpkg $INSTALLOPT "${INSTOPTS[@]}" -- "${BINS[@]}" || RVAL=$?
+        if [ $((MY_UID)) -eq 0 ]; then
+            dpkg $INSTALLOPT "${INSTOPTS[@]}" -- "${BINS[@]}" || RVAL=$?
+        else
+            $SUDO_CMD "dpkg $INSTALLOPT ${INSTOPTS[@]} -- ${BINS[@]}" || RVAL=$?
+        fi
     fi
 
     if [ "$RVAL" != "0" ]; then
@@ -298,6 +384,7 @@ build_by_line() {
 
 build_list() {
     local LNUM=0 INPUT_ID TOKS ROOTOPT RVAL=0 RVALS FULL_LINE TRUNC_LINE
+    local INDICATOR
 
     case "$1" in
     -r | --root)     ROOTOPT="--root=$2" ; shift 2 ;;
@@ -316,10 +403,18 @@ build_list() {
         if [ -z "$FULL_LINE" ]; then
             # Blank line.
             continue
-        elif [ "${FULL_LINE#!}" != "$FULL_LINE" ]; then
-            FULL_LINE="${FULL_LINE#!}"
-
+        elif [ "${FULL_LINE#[\!\<\>]}" != "$FULL_LINE" ]; then
             # This isn't a build item, but rather a raw shell command.
+            INDICATOR="${FULL_LINE:0:1}"
+            FULL_LINE="${FULL_LINE:1}"
+
+            # Check if this command is supposed to be run only inside or
+            # only outside of a chroot.
+            if [ "${INDICATOR}${IN_CHROOT}" = '<yes' ] ||
+               [ "${INDICATOR}${IN_CHROOT}" = '>no' ]; then
+                continue
+            fi
+
             if [ -n "$PLUGIN_LIST" ]; then
                 # For custom commands, filter out everything but characters
                 # typically used in file paths or command names.  Anything
@@ -344,7 +439,7 @@ build_list() {
                 : | /bin/sh -c "${FULL_LINE#!}"
                 RVAL=$?
             fi
-        elif [ "${#TOKS[@]}" = "6" ]; then
+        elif [ "${#TOKS[@]}" = "6" ] || [ "${#TOKS[@]}" = "7" ]; then
             if [ -n "$PLUGIN_LIST" ]; then
                 : | build_by_line "$ROOTOPT" "${TOKS[@]}" 2>&1 | chain_plugins "${TOKS[@]}"
                 RVALS=( ${PIPESTATUS[@]} )
@@ -379,7 +474,7 @@ build_list() {
 }
 
 report_version() {
-    echo "${CMDPATH} version 0.3"
+    echo "${CMDPATH} version 0.4"
     return 0
 }
 
@@ -468,6 +563,46 @@ while [ $# -gt 0 ]; do
     *)               break ;;
     esac
 done
+
+export BUILD_UID=`getent passwd ivaldi | cut -d: -f3`
+
+if [ -z "$BUILD_UID" ]; then
+    echo "ERROR: Unknown build user '$BUILD_USER'" >&2
+    exit 1
+fi
+
+# Make sure we've got a UTF-capable locale configured; some builds can cause
+# logging complications otherwise.
+echo $LANG $LC_ALL | grep -qi '\.utf'
+
+if [ "$?" != "0" ]; then
+    echo "WARNING: no active UTF-capable locale detected; adjusting now..." >&2
+    type -p localedef >&/dev/null
+
+    if [ "$?" = "0" ]; then
+        # Let's try to come up with a locale that will keep col from barfing
+        # on some random oddball Unicode byte-sequence.
+        USELOC=""
+
+        for TRYLOC in `localedef --list-archive | grep -i '\.utf'`; do
+            ERRCNT=`/bin/bash -c "LC_ALL=$TRYLOC" 2|& wc -l`
+            if [ "$ERRCNT" = "0" ]; then
+                USELOC="$TRYLOC"
+                break
+            fi
+        done
+
+        if [ -n "$USELOC" ]; then
+            echo "Selected locale '$USELOC'" >&2
+            export LC_ALL="$USELOC"
+            export LANG="$USELOC"
+        else
+            echo "WARNING: No UTF-capable locale available?" >&2
+        fi
+    else
+        echo "WARNING: Cannot query locale database (missing localedef)" >&2
+    fi
+fi
 
 if [ -z "$DPKG_HELP_LOADOPT" ] && [ -n "$DEFAULT_LOADOPT" ]; then
     echo "WARNING: IGNORING '$DEFAULT_LOADOPT': not supported by dpkg" >&2
