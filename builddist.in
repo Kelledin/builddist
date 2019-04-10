@@ -134,7 +134,7 @@ build_by_line() {
         BINS=( `echo "${6//,/ }"` )
     fi
 
-    if [ "${ROOT#?*://}" = "$ROOT" ] && [ "${ROOT#/}" != "$ROOT" ]; then
+    if [ "${ROOT#?*://}" = "$ROOT" ] && [ "${ROOT#/}" = "$ROOT" ]; then
         # Relative local path?  Turn it into an absolute path.
         ROOT="${PWD}/${ROOT}"
     fi
@@ -474,7 +474,7 @@ build_list() {
 }
 
 report_version() {
-    echo "${CMDPATH} version 0.4"
+    echo "${CMDPATH} version 0.5"
     return 0
 }
 
