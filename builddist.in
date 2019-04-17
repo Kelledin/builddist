@@ -5,6 +5,9 @@ export PLUGIN_LIST=""
 export BUILD_USER=`id -un`
 export MY_UID=`id -u`
 export VERBOSITY=1
+export SIGNING_KEY=""
+export DGET_CHECK=""
+export DPKG_CHECK=""
 export PLUGINDIR="@plugindir@"
 ischroot && export IN_CHROOT=yes || export IN_CHROOT=no
 
@@ -98,6 +101,7 @@ build_by_line() {
     local DSCPATH JOBOPT="$DEFAULT_JOBOPT" ARTDIR="$PWD" SUDO_CMD="" BINVER=""
     local BINARCH="" THISBIN CMDTOKS BUILDCMD INSTALLOPT="-i" THISOPT RVAL=0
     local LOADOPT="$DEFAULT_LOADOPT" PROFILES="" USE_ENVOPTS="" PROFOPT=""
+    local KEYOPT=""
 
     case "$1" in
     -r | --root) ROOT="$2"                            ; shift 2  ;;
@@ -157,14 +161,22 @@ build_by_line() {
     cd "$BUILDDIR"
 
     if [ "${ROOT#/}" != "$ROOT" ]; then
-        dpkg-source -x "${ROOT}/${NAME}_${VER}.dsc" || RVAL=$?
+        dpkg-source $DPKG_CHECK -x "${ROOT}/${NAME}_${VER}.dsc" || RVAL=$?
     else
-        dget -u "${ROOT}/${NAME}_${VER}.dsc" || RVAL=$?
+        dget $DGET_CHECK "${ROOT}/${NAME}_${VER}.dsc" || RVAL=$?
     fi
 
     if [ "$RVAL" != "0" ]; then
         echo "ERROR: cannot download or extract source tree" >&2
         return $RVAL
+    fi
+
+    # We keep the signing key separate because we very well might have to
+    # quote it.
+    if [ -n "$SIGNING_KEY" ]; then
+        KEYOPT="--sign-key=$SIGNING_KEY"
+    else
+        KEYOPT="--no-sign"
     fi
 
     # Make sure job count is specified in the build options.  While we're
@@ -266,7 +278,13 @@ build_by_line() {
         BUILDCMD="dpkg-buildpackage --build=binary ${BLDOPTS[@]}"
     fi
 
-    echo "builddist: DEB_BUILD_OPTIONS='$USE_ENVOPTS', dpkg-buildpackage options='${BLDOPTS[@]}'"
+    echo "builddist: DEB_BUILD_OPTIONS: $USE_ENVOPTS"
+
+    if [ -n "$SIGNING_KEY" ]; then
+        echo "builddist: dpkg-buildpackage options: ${BLDOPTS[@]} --sign-key='${SIGNING_KEY}'"
+    else
+        echo "builddist: dpkg-buildpackage options: ${BLDOPTS[@]} --no-sign"
+    fi
 
     if [ $((MY_UID)) -ne $((BUILD_UID)) ]; then
         # FIXME: have a separate sudo command for the chown step...
@@ -275,17 +293,17 @@ build_by_line() {
         if [ "$RVAL" = "0" ]; then
             if [ -n "${USE_ENVOPTS}" ]; then
                 DEB_BUILD_OPTIONS="${USE_ENVOPTS}" \
-                $SUDO_CMD "$BUILDCMD" || RVAL=$?
+                $SUDO_CMD "$BUILDCMD '${KEYOPT}'" || RVAL=$?
             else
-                $SUDO_CMD "$BUILDCMD" || RVAL=?$
+                $SUDO_CMD "$BUILDCMD '${KEYOPT}'" || RVAL=$?
             fi
         fi
     else
         if [ -n "${USE_ENVOPTS}" ]; then
             DEB_BUILD_OPTIONS="${USE_ENVOPTS}" \
-            $BUILDCMD || RVAL=$?
+            $BUILDCMD "${KEYOPT}" || RVAL=$?
         else
-            $BUILDCMD || RVAL=$?
+            $BUILDCMD "${KEYOPT}" || RVAL=$?
         fi
     fi
 
@@ -322,8 +340,8 @@ build_by_line() {
         ?*_?*_?*)     THISBIN="${THISBIN}.deb" ;;
         # Version-garnished.  Deduce arch via wildcard...
         ?*_?*)        THISBIN=`echo "${THISBIN}_"*.deb` ;;
-        # No garnish.  Assume source version; deduce arch by garnish...
-        *)            THISBIN=`echo "${THISBIN}_${VER}_"*.deb` ;;
+        # No garnish.  Deduce arch and binary version via wildcard...
+        *)            THISBIN=`echo "${THISBIN}"_*_*.deb` ;;
         esac
 
         if [ ! -f "$THISBIN" ]; then
@@ -483,8 +501,9 @@ usage() {
     cat << EOF
 USAGE: ${CMDPATH} [-r|--root <path>] [-p|--plugin <plugin>[,...]]
                  [-P|--plugin-dir <dir>] [-u|--user <user>] [-a|--arch <arch>]
-                 [-j|--jobs <count>] [-l|--load <load>] [-v|--verbose]
-                 [-q|--quiet] [--version] [-h|--help] [buildlist] ...
+                 [-j|--jobs <count>] [-l|--load <load>] [-k|--sign-key <id>]
+                 [-U,--no-check] [-v|--verbose] [-q|--quiet] [--version]
+                 [-h|--help] [buildlist] ...
 
     -r,--root <path>      : specify local file path or URL where source
                             packages are stored (default current directory)
@@ -499,6 +518,14 @@ USAGE: ${CMDPATH} [-r|--root <path>] [-p|--plugin <plugin>[,...]]
     -j,--jobs <count>     : set default job count (default: auto)
     -l,--load <load>      : set default maximum load (default: auto if
                             supported)
+    -k,--sign-key <id>    : sign binaries with specified key ID (default:
+                            no signing)
+                            NOTE: the user building the package (current user,
+                            or target user if '-u' is specified) MUST have the
+                            specified secret key in their keyring, and it
+                            should NOT require a passphrase.
+    -U,--no-check         : do not check source package signatures for
+                            remote downloads
     -v,--verbose          : increase verbosity
     -q,--quiet            : decrease verbosity
     -V,--version          : report version
@@ -538,9 +565,9 @@ add_plugins() {
 }
 
 opts=$(getopt \
-    --longoptions 'user:,root:,plugin:,plugin-dir:,arch:,jobs:,load:,verbose,quiet,version,help' \
+    --longoptions 'user:,root:,plugin:,plugin-dir:,sign-key:,arch:,jobs:,load:,no-check,verbose,quiet,version,help' \
     --name "$CMDNAME" \
-    --options "u:r:p:P:a:j:l:vqVh" \
+    --options "u:r:p:P:a:j:l:k:UvqVh" \
     -- "$@"
 )
 
@@ -548,17 +575,19 @@ eval set --$opts
 
 while [ $# -gt 0 ]; do
     case "$1" in
-    -u|--user)       BUILD_USER="$2"             ; shift 2 ;;
-    -r|--root)       ROOTOPT="--root=$2"         ; shift 2 ;;
-    -p|--plugin)     add_plugins "$2"            ; shift 2 ;;
-    -P|--plugin-dir) PLUGINDIR="$2"              ; shift 2 ;;
-    -a|--arch)       DEFAULT_ARCH="$2"           ; shift 2 ;;
-    -j|--jobs)       DEFAULT_JOBOPT="--jobs=$2"  ; shift 2 ;;
-    -l|--load)       DEFAULT_LOADOPT="--load=$2" ; shift 2 ;;
-    -v|--verbose)    VERBOSITY=$((VERBOSITY+1))  ; shift   ;;
-    -q|--quiet)      VERBOSITY=$((VERBOSITY-1))  ; shift   ;;
-    -V|--version)    report_version              ; exit 0  ;; 
-    -h|--help)       usage                       ; exit 0  ;;
+    -u|--user)       BUILD_USER="$2"                         ; shift 2 ;;
+    -r|--root)       ROOTOPT="--root=$2"                     ; shift 2 ;;
+    -p|--plugin)     add_plugins "$2"                        ; shift 2 ;;
+    -P|--plugin-dir) PLUGINDIR="$2"                          ; shift 2 ;;
+    -a|--arch)       DEFAULT_ARCH="$2"                       ; shift 2 ;;
+    -j|--jobs)       DEFAULT_JOBOPT="--jobs=$2"              ; shift 2 ;;
+    -l|--load)       DEFAULT_LOADOPT="--load=$2"             ; shift 2 ;;
+    -k|--sign-key)   SIGNING_KEY="$2"                        ; shift 2 ;;
+    -U|--no-check)   DGET_CHECK="-u"; DPKG_CHECK="--no-check"; shift   ;;
+    -v|--verbose)    VERBOSITY=$((VERBOSITY+1))              ; shift   ;;
+    -q|--quiet)      VERBOSITY=$((VERBOSITY-1))              ; shift   ;;
+    -V|--version)    report_version                          ; exit 0  ;; 
+    -h|--help)       usage                                   ; exit 0  ;;
     --)              shift ;  break ;;
     *)               break ;;
     esac
